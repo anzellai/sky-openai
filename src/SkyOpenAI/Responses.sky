@@ -41,14 +41,14 @@ import Sky.Core.Json.Encode as JsonE
 import Sky.Core.Json.Decode as JsonD
 import Std.Ai.Provider as Provider exposing (ChatResponse, Message, Provider)
 
-{-| The reasoning effort sent in the Responses request.
+{-| The documented `reasoning.effort` values for a Responses request.
 
-These cases match the levels currently accepted by GPT-5.6 Luna. Support remains
-model-dependent; OpenAI returns HTTP 400 when a selected model does not accept a
-level.
+Support remains model-dependent; callers must choose a level accepted by the
+selected model. OpenAI returns HTTP 400 for an unsupported level.
 -}
 type ReasoningEffort
     = None
+    | Minimal
     | Low
     | Medium
     | High
@@ -173,6 +173,9 @@ reasoningEffortValue effort =
 
         None ->
             "none"
+
+        Minimal ->
+            "minimal"
 
         Low ->
             "low"

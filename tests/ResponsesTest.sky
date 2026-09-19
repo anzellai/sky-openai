@@ -1,10 +1,8 @@
 module ResponsesTest exposing (tests)
 
-{-| Decode tests for `SkyOpenAI.Responses`. They feed a canonical OpenAI
-Responses API body through `decodeResponse` and assert the mapping onto a
-`Provider.ChatResponse`: the `output_text` parts are joined (a reasoning item is
-skipped), and the Responses `usage` (input/output/total tokens) maps onto the
-`Usage` record. No network.
+{-| Offline tests for `SkyOpenAI.Responses`. They decode a canonical OpenAI
+Responses API body into a `Provider.ChatResponse` and encode request payloads.
+No network.
 -}
 
 import Sky.Core.Prelude exposing (..)
@@ -81,5 +79,14 @@ tests =
                             , Responses.XHigh
                             , Responses.Max
                             ]))
+          , Test.test
+                "encodes the model-dependent minimal effort"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"reasoning-model\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"minimal\"}}"
+                        (Responses.encodeRequest
+                            "reasoning-model"
+                            (Just Responses.Minimal)
+                            [ Provider.user "Solve it." ]))
           ]
     ]
