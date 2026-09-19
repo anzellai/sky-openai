@@ -51,6 +51,19 @@ provider =
 --     |> Task.map .content
 ```
 
+For reasoning-capable models, opt in to `reasoning.effort` with a typed level.
+The available level remains model-dependent; as an example, GPT-5.6 Luna supports `None`, `Low`,
+`Medium`, `High`, `XHigh`, and `Max`.
+
+```elm
+reasoningProvider : Provider.Provider
+reasoningProvider =
+    Responses.providerWithReasoningEffort
+        (Secret.fromEnv "OPENAI_API_KEY")
+        "gpt-5.6-luna"
+        Responses.High
+```
+
 Chat Completions (also built into the stdlib as `Provider.openai`; exposed here
 so the whole OpenAI surface is in one package):
 
@@ -83,7 +96,11 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
 - `SkyOpenAI.Responses.provider` / `providerAt` — a single Responses call: the
   messages go out as the Responses `input`, the `output_text` parts and the token
   `usage` come back as a `Provider.ChatResponse`.
-- `SkyOpenAI.Responses.decodeResponse` — decode a raw Responses body yourself.
+- `SkyOpenAI.Responses.providerWithReasoningEffort` /
+  `providerAtWithReasoningEffort` — opt into `reasoning.effort` for models that
+  support it.
+- `SkyOpenAI.Responses.encodeRequest` / `decodeResponse` — encode or decode raw
+  Responses API bodies yourself.
 
 ## Roadmap
 
