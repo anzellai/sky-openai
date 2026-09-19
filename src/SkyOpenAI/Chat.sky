@@ -1,0 +1,33 @@
+module SkyOpenAI.Chat exposing (provider, compatible)
+
+{-| `SkyOpenAI.Chat` — the OpenAI Chat Completions endpoint.
+
+Chat Completions is also built into the stdlib (`Std.Ai.Provider.openai` /
+`compatible`). These are thin aliases, so the whole OpenAI surface — Chat
+Completions here, the Responses API in `SkyOpenAI.Responses` — lives in one
+package. Both return a `Std.Ai.Provider.Provider`, so they compose with `Agent`,
+`Policy`, `Trace`, and `cost`.
+
+    import SkyOpenAI.Chat as Chat
+    import Sky.Core.Secret as Secret
+
+    provider =
+        Chat.provider (Secret.fromEnv "OPENAI_API_KEY") "gpt-4o-mini"
+-}
+
+import Sky.Core.Secret exposing (Secret)
+import Std.Ai.Provider as Provider exposing (Provider)
+
+
+{-| The hosted OpenAI Chat Completions endpoint. -}
+provider : Secret -> String -> Provider
+provider apiKey model =
+    Provider.openai apiKey model
+
+
+{-| Any OpenAI-compatible Chat Completions endpoint — a gateway, vLLM, or a local
+llama.cpp server.
+-}
+compatible : String -> Secret -> String -> Provider
+compatible endpoint apiKey model =
+    Provider.compatible endpoint apiKey model

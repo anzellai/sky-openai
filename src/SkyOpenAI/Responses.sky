@@ -1,0 +1,153 @@
+module SkyOpenAI.Responses exposing (provider, providerAt, decodeResponse)
+
+{-| `SkyOpenAI.Responses` — the OpenAI Responses API as a Sky `Provider`.
+
+The Responses API (`POST /v1/responses`) is OpenAI's newer interaction model. This
+module maps a Sky chat (a `List Provider.Message`) onto a single Responses call and
+returns the assistant text plus token usage, so it drops into `Std.Ai.Agent`,
+`Policy`, `Trace`, and `cost` exactly like the built-in chat-completions provider.
+
+It is built on `Provider.custom`, the `Std.Ai.Provider` extension point, so no
+compiler or stdlib change is needed to add it.
+
+    import SkyOpenAI.Responses as Responses
+    import Sky.Core.Secret as Secret
+
+    provider =
+        Responses.provider (Secret.fromEnv "OPENAI_API_KEY") "gpt-4o-mini"
+
+This is a first cut: it sends the messages as the Responses `input`, reads the
+`output_text` parts and the token `usage`, and returns a `Provider.ChatResponse`.
+Stateful chaining (`previous_response_id`), the server-side built-in tools
+(web_search, file_search), and native function-calling are the next increments,
+each of which stays inside this module.
+-}
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Task as Task
+import Sky.Core.Error as Error
+import Sky.Core.String as String
+import Sky.Core.Secret exposing (Secret)
+import Sky.Core.Http as Http
+import Sky.Core.Json.Encode as JsonE
+import Sky.Core.Json.Decode as JsonD
+import Std.Ai.Provider as Provider exposing (ChatResponse, Message, Provider)
+
+
+{-| A Responses provider against the hosted OpenAI endpoint. -}
+provider : Secret -> String -> Provider
+provider apiKey model =
+    providerAt "https://api.openai.com/v1/responses" apiKey model
+
+
+{-| A Responses provider against a specific endpoint — an Azure deployment, a
+proxy, or a compatible gateway.
+-}
+providerAt : String -> Secret -> String -> Provider
+providerAt endpoint apiKey model =
+    Provider.custom (chatViaResponses endpoint apiKey model)
+
+
+chatViaResponses : String -> Secret -> String -> List Message -> Task Error ChatResponse
+chatViaResponses endpoint apiKey model messages =
+    let
+        req = Http.defaultRequest endpoint
+    in
+        { req | method = "POST" } |> Http.withBearer apiKey
+            |> Http.withHeader "Content-Type" "application/json"
+            |> Http.withBody (requestBody model messages)
+            |> Http.request
+            |> Task.andThen
+                   (\resp ->
+                       if resp.status >= 200 && resp.status < 300 then
+                           case JsonD.decodeString responseDecoder resp.body of
+
+                               Ok r ->
+                                   Task.succeed r
+
+                               Err e ->
+                                   Task.fail e
+
+                       else
+                           Task.fail
+                               (Error.unexpected
+                                   ("OpenAI Responses failed: HTTP "
+                                       ++ String.fromInt resp.status
+                                       ++ " — "
+                                       ++ resp.body)))
+
+
+{-| Decode a raw OpenAI Responses API body into a `Provider.ChatResponse` — the
+assistant text (the `output_text` parts joined) and the token `usage`. Exposed
+so a caller can decode a body it fetched itself, and so the mapping is testable.
+-}
+decodeResponse : String -> Result Error ChatResponse
+decodeResponse body =
+    JsonD.decodeString responseDecoder body
+
+
+requestBody : String -> List Message -> String
+requestBody model messages =
+    JsonE.encode
+        0
+        (JsonE.object
+            [ ( "model", JsonE.string model )
+            , ( "input", JsonE.list messageValue messages )
+            ])
+
+
+messageValue m =
+    JsonE.object
+        [ ( "role", JsonE.string m.role )
+        , ( "content", JsonE.string m.content )
+        ]
+
+
+responseDecoder =
+    JsonD.map2
+        (\content usage -> { content = content, usage = usage })
+        outputText
+        (JsonD.oneOf
+            [ JsonD.field "usage" usageDecoder
+            , JsonD.succeed
+                  { promptTokens = 0, completionTokens = 0, totalTokens = 0 }
+            ])
+
+
+-- The Responses API returns an `output` array of items; a message item carries a
+-- `content` array whose `output_text` parts hold the text. Concatenate them, so a
+-- reasoning item or any non-text part contributes nothing rather than failing.
+outputText =
+    JsonD.oneOf
+        [ JsonD.field "output" (JsonD.list itemText)
+              |> JsonD.map (String.join "")
+        , JsonD.succeed ""
+        ]
+
+
+itemText =
+    JsonD.oneOf
+        [ JsonD.field "content" (JsonD.list partText)
+              |> JsonD.map (String.join "")
+        , JsonD.succeed ""
+        ]
+
+
+partText =
+    JsonD.map2
+        (\ty txt ->
+            if ty == "output_text" then
+                txt
+
+            else
+                "")
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "text" JsonD.string, JsonD.succeed "" ])
+
+
+usageDecoder =
+    JsonD.map3
+        (\i o t -> { promptTokens = i, completionTokens = o, totalTokens = t })
+        (JsonD.oneOf [ JsonD.field "input_tokens" JsonD.int, JsonD.succeed 0 ])
+        (JsonD.oneOf [ JsonD.field "output_tokens" JsonD.int, JsonD.succeed 0 ])
+        (JsonD.oneOf [ JsonD.field "total_tokens" JsonD.int, JsonD.succeed 0 ])

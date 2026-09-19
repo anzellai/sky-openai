@@ -1,0 +1,7 @@
+sky-out/
+.skycache/
+.skydeps/
+.skydata/
+.sky/
+sky.lock
+*.private.md
