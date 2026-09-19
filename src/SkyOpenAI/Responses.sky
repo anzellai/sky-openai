@@ -1,4 +1,12 @@
-module SkyOpenAI.Responses exposing (provider, providerAt, decodeResponse)
+module SkyOpenAI.Responses exposing
+    ( ReasoningEffort(..)
+    , provider
+    , providerWithReasoningEffort
+    , providerAt
+    , providerAtWithReasoningEffort
+    , encodeRequest
+    , decodeResponse
+    )
 
 {-| `SkyOpenAI.Responses` — the OpenAI Responses API as a Sky `Provider`.
 
@@ -16,11 +24,11 @@ compiler or stdlib change is needed to add it.
     provider =
         Responses.provider (Secret.fromEnv "OPENAI_API_KEY") "gpt-4o-mini"
 
-This is a first cut: it sends the messages as the Responses `input`, reads the
-`output_text` parts and the token `usage`, and returns a `Provider.ChatResponse`.
-Stateful chaining (`previous_response_id`), the server-side built-in tools
-(web_search, file_search), and native function-calling are the next increments,
-each of which stays inside this module.
+This is a first cut: it sends the messages as the Responses `input`, optionally
+sets `reasoning.effort`, reads the `output_text` parts and the token `usage`, and
+returns a `Provider.ChatResponse`. Stateful chaining (`previous_response_id`),
+the server-side built-in tools (web_search, file_search), and native
+function-calling are the next increments, each of which stays inside this module.
 -}
 
 import Sky.Core.Prelude exposing (..)
@@ -33,29 +41,71 @@ import Sky.Core.Json.Encode as JsonE
 import Sky.Core.Json.Decode as JsonD
 import Std.Ai.Provider as Provider exposing (ChatResponse, Message, Provider)
 
+{-| The reasoning effort sent in the Responses request.
 
-{-| A Responses provider against the hosted OpenAI endpoint. -}
+These cases match the levels currently accepted by GPT-5.6 Luna. Support remains
+model-dependent; OpenAI returns HTTP 400 when a selected model does not accept a
+level.
+-}
+type ReasoningEffort
+    = None
+    | Low
+    | Medium
+    | High
+    | XHigh
+    | Max
+
+
+{-| A Responses provider against the hosted OpenAI endpoint.
+
+This leaves `reasoning.effort` unset, so OpenAI selects the model default.
+-}
 provider : Secret -> String -> Provider
 provider apiKey model =
     providerAt "https://api.openai.com/v1/responses" apiKey model
 
 
+{-| A hosted Responses provider that sets `reasoning.effort`.
+
+    Responses.providerWithReasoningEffort apiKey "gpt-5.6-luna" High
+-}
+providerWithReasoningEffort : Secret -> String -> ReasoningEffort -> Provider
+providerWithReasoningEffort apiKey model effort =
+    providerAtWithReasoningEffort
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        effort
+
+
 {-| A Responses provider against a specific endpoint — an Azure deployment, a
-proxy, or a compatible gateway.
+proxy, or a compatible gateway. This leaves `reasoning.effort` unset.
 -}
 providerAt : String -> Secret -> String -> Provider
 providerAt endpoint apiKey model =
-    Provider.custom (chatViaResponses endpoint apiKey model)
+    providerAtWithOptionalReasoningEffort endpoint apiKey model Nothing
 
 
-chatViaResponses : String -> Secret -> String -> List Message -> Task Error ChatResponse
-chatViaResponses endpoint apiKey model messages =
+{-| A Responses provider against a specific endpoint that sets `reasoning.effort`.
+-}
+providerAtWithReasoningEffort : String -> Secret -> String -> ReasoningEffort -> Provider
+providerAtWithReasoningEffort endpoint apiKey model effort =
+    providerAtWithOptionalReasoningEffort endpoint apiKey model (Just effort)
+
+
+providerAtWithOptionalReasoningEffort : String -> Secret -> String -> Maybe ReasoningEffort -> Provider
+providerAtWithOptionalReasoningEffort endpoint apiKey model effort =
+    Provider.custom (chatViaResponses endpoint apiKey model effort)
+
+
+chatViaResponses : String -> Secret -> String -> Maybe ReasoningEffort -> List Message -> Task Error ChatResponse
+chatViaResponses endpoint apiKey model effort messages =
     let
         req = Http.defaultRequest endpoint
     in
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
-            |> Http.withBody (requestBody model messages)
+            |> Http.withBody (encodeRequest model effort messages)
             |> Http.request
             |> Task.andThen
                    (\resp ->
@@ -86,14 +136,58 @@ decodeResponse body =
     JsonD.decodeString responseDecoder body
 
 
-requestBody : String -> List Message -> String
-requestBody model messages =
+{-| Encode the Responses API request body.
+
+Pass `Nothing` to omit `reasoning`, preserving the model default. The
+`providerWithReasoningEffort` constructors use `Just` internally.
+-}
+encodeRequest : String -> Maybe ReasoningEffort -> List Message -> String
+encodeRequest model effort messages =
     JsonE.encode
         0
         (JsonE.object
-            [ ( "model", JsonE.string model )
-            , ( "input", JsonE.list messageValue messages )
-            ])
+            (case effort of
+
+                Just selectedEffort ->
+                    [ ( "model", JsonE.string model )
+                    , ( "input", JsonE.list messageValue messages )
+                    , ( "reasoning"
+                      , JsonE.object
+                            [ ( "effort"
+                              , JsonE.string
+                                    (reasoningEffortValue selectedEffort)
+                              )
+                            ]
+                      )
+                    ]
+
+                Nothing ->
+                    [ ( "model", JsonE.string model )
+                    , ( "input", JsonE.list messageValue messages )
+                    ]))
+
+
+reasoningEffortValue : ReasoningEffort -> String
+reasoningEffortValue effort =
+    case effort of
+
+        None ->
+            "none"
+
+        Low ->
+            "low"
+
+        Medium ->
+            "medium"
+
+        High ->
+            "high"
+
+        XHigh ->
+            "xhigh"
+
+        Max ->
+            "max"
 
 
 messageValue m =

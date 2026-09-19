@@ -11,6 +11,7 @@ import Sky.Core.Prelude exposing (..)
 import Sky.Core.Result exposing (Result(..))
 import Sky.Test as Test exposing (Test)
 import SkyOpenAI.Responses as Responses
+import Std.Ai.Provider as Provider
 
 
 sampleBody : String
@@ -47,5 +48,38 @@ tests =
 
                         Err _ ->
                             Test.fail "decode failed")
+          , Test.test
+                "omits reasoning when it is not configured"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}]}"
+                        (Responses.encodeRequest
+                            "gpt-5.6-luna"
+                            Nothing
+                            [ Provider.user "Solve it." ]))
+          , Test.test
+                "encodes every GPT-5.6 Luna reasoning effort"
+                (\_ ->
+                    Test.equal
+                        [ "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"none\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"low\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"medium\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"high\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"xhigh\"}}"
+                        , "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Solve it.\"}],\"reasoning\":{\"effort\":\"max\"}}"
+                        ]
+                        (List.map
+                            (\effort ->
+                                Responses.encodeRequest
+                                    "gpt-5.6-luna"
+                                    (Just effort)
+                                    [ Provider.user "Solve it." ])
+                            [ Responses.None
+                            , Responses.Low
+                            , Responses.Medium
+                            , Responses.High
+                            , Responses.XHigh
+                            , Responses.Max
+                            ]))
           ]
     ]
