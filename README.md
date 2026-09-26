@@ -51,6 +51,57 @@ provider =
 --     |> Task.map .content
 ```
 
+For reasoning-capable models, opt in to `reasoning.effort` with a typed level.
+The available level remains model-dependent; as an example, GPT-5.6 Luna supports `None`, `Low`,
+`Medium`, `High`, `XHigh`, and `Max`.
+
+```elm
+reasoningProvider : Provider.Provider
+reasoningProvider =
+    Responses.providerWithReasoningEffort
+        (Secret.fromEnv "OPENAI_API_KEY")
+        "gpt-5.6-luna"
+        Responses.High
+```
+
+### Hosted Skills
+
+Upload a local Skill ZIP, retain the returned ID/version metadata, and attach it
+to a Responses provider. Execution happens in OpenAI's hosted shell; this package
+does not execute local shell commands.
+
+```elm
+import SkyOpenAI.Responses as Responses
+import Sky.Core.Secret as Secret
+import Sky.Core.Task as Task
+
+key = Secret.fromEnv "OPENAI_API_KEY"
+
+uploaded : Task Error Responses.UploadedSkill
+uploaded =
+    Responses.uploadSkillZip key "./csv_insights_skill.zip"
+
+skill : Responses.HostedSkill
+skill =
+    { skillId = "skill_..."
+    , version = Just (Responses.Number 2)
+    }
+
+providerWithSkill : Provider.Provider
+providerWithSkill =
+    Responses.providerWithOptions
+        key
+        "gpt-6-astra"
+        { reasoningEffort = Nothing
+        , hostedSkills = [ skill ]
+        }
+```
+
+Use `Nothing` for a Skill's default version, `Just Responses.Latest` to follow
+the latest version, or `Just (Responses.Number 2)` to pin a version. The ZIP upload
+must contain exactly one top-level Skill directory with one `SKILL.md` manifest.
+OpenAI documents limits of 50 MB compressed, 500 files, and 25 MB uncompressed.
+
 Chat Completions (also built into the stdlib as `Provider.openai`; exposed here
 so the whole OpenAI surface is in one package):
 
@@ -83,7 +134,14 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
 - `SkyOpenAI.Responses.provider` / `providerAt` — a single Responses call: the
   messages go out as the Responses `input`, the `output_text` parts and the token
   `usage` come back as a `Provider.ChatResponse`.
-- `SkyOpenAI.Responses.decodeResponse` — decode a raw Responses body yourself.
+- `SkyOpenAI.Responses.providerWithReasoningEffort` /
+  `providerAtWithReasoningEffort` — opt into `reasoning.effort` for models that
+  support it.
+- `SkyOpenAI.Responses.encodeRequest` / `decodeResponse` — encode or decode raw
+  Responses API bodies yourself.
+- `SkyOpenAI.Responses.uploadSkillZip` — upload a ZIP Skill and decode its ID and
+  version pointers; `providerWithOptions` / `providerAtWithOptions` attach hosted
+  Skills through `container_auto`.
 
 ## Roadmap
 
