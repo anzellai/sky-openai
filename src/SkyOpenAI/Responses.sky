@@ -1,11 +1,21 @@
 module SkyOpenAI.Responses exposing
     ( ReasoningEffort(..)
+    , SkillVersion(..)
+    , HostedSkill
+    , UploadedSkill
+    , RequestOptions
     , provider
     , providerWithReasoningEffort
     , providerAt
     , providerAtWithReasoningEffort
+    , providerWithOptions
+    , providerAtWithOptions
     , encodeRequest
     , decodeResponse
+    , encodeRequestWithOptions
+    , uploadSkillZip
+    , encodeSkillUploadBody
+    , decodeUploadedSkill
     )
 
 {-| `SkyOpenAI.Responses` — the OpenAI Responses API as a Sky `Provider`.
@@ -24,17 +34,34 @@ compiler or stdlib change is needed to add it.
     provider =
         Responses.provider (Secret.fromEnv "OPENAI_API_KEY") "gpt-4o-mini"
 
-This is a first cut: it sends the messages as the Responses `input`, optionally
-sets `reasoning.effort`, reads the `output_text` parts and the token `usage`, and
-returns a `Provider.ChatResponse`. Stateful chaining (`previous_response_id`),
-the server-side built-in tools (web_search, file_search), and native
-function-calling are the next increments, each of which stays inside this module.
+Hosted Skills are uploaded as ZIP files and mounted into OpenAI's hosted shell:
+
+    skill =
+        { skillId = "skill_..."
+        , version = Just (Responses.Number 2)
+        }
+
+    provider =
+        Responses.providerWithOptions
+            (Secret.fromEnv "OPENAI_API_KEY")
+            "gpt-6-astra"
+            { reasoningEffort = Nothing
+            , hostedSkills = [ skill ]
+            }
+
+This module sends messages as the Responses `input`, optionally sets
+`reasoning.effort`, attaches hosted Skills through `container_auto`, reads the
+`output_text` parts from message items, and returns token usage. Stateful chaining
+(`previous_response_id`), the server-side built-in tools (web_search, file_search),
+and native function-calling remain outside this first provider surface.
 -}
 
 import Sky.Core.Prelude exposing (..)
 import Sky.Core.Task as Task
 import Sky.Core.Error as Error
 import Sky.Core.String as String
+import Sky.Core.Bytes as Bytes
+import Sky.Core.File as File
 import Sky.Core.Secret exposing (Secret)
 import Sky.Core.Http as Http
 import Sky.Core.Json.Encode as JsonE
@@ -55,14 +82,51 @@ type ReasoningEffort
     | XHigh
     | Max
 
+{-| A hosted Skill version selector.
+
+`Latest` floats to the API's latest uploaded version. `Number` pins a specific
+version. A missing version uses the Skill's default version.
+-}
+type SkillVersion
+    = Latest
+    | Number Int
+
+{-| A hosted Skill to attach to a Responses shell tool. -}
+type alias HostedSkill =
+    { skillId : String
+    , version : Maybe SkillVersion
+    }
+
+{-| The Skill metadata returned after a ZIP upload. -}
+type alias UploadedSkill =
+    { id : String
+    , name : String
+    , description : String
+    , defaultVersion : Int
+    , latestVersion : Int
+    }
+
+{-| Optional Responses provider behavior. Empty `hostedSkills` preserves the
+legacy request shape and does not add a shell tool.
+-}
+type alias RequestOptions =
+    { reasoningEffort : Maybe ReasoningEffort
+    , hostedSkills : List HostedSkill
+    }
+
 
 {-| A Responses provider against the hosted OpenAI endpoint.
 
-This leaves `reasoning.effort` unset, so OpenAI selects the model default.
+This leaves `reasoning.effort` unset and attaches no hosted Skills, so OpenAI
+selects the model default and the legacy request shape is preserved.
 -}
 provider : Secret -> String -> Provider
 provider apiKey model =
-    providerAt "https://api.openai.com/v1/responses" apiKey model
+    providerAtWithOptions
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        { reasoningEffort = Nothing, hostedSkills = [] }
 
 
 {-| A hosted Responses provider that sets `reasoning.effort`.
@@ -71,41 +135,62 @@ provider apiKey model =
 -}
 providerWithReasoningEffort : Secret -> String -> ReasoningEffort -> Provider
 providerWithReasoningEffort apiKey model effort =
-    providerAtWithReasoningEffort
+    providerAtWithOptions
         "https://api.openai.com/v1/responses"
         apiKey
         model
-        effort
+        { reasoningEffort = Just effort, hostedSkills = [] }
 
 
 {-| A Responses provider against a specific endpoint — an Azure deployment, a
-proxy, or a compatible gateway. This leaves `reasoning.effort` unset.
+proxy, or a compatible gateway. This leaves `reasoning.effort` unset and attaches
+no hosted Skills.
 -}
 providerAt : String -> Secret -> String -> Provider
 providerAt endpoint apiKey model =
-    providerAtWithOptionalReasoningEffort endpoint apiKey model Nothing
+    providerAtWithOptions
+        endpoint
+        apiKey
+        model
+        { reasoningEffort = Nothing, hostedSkills = [] }
 
 
-{-| A Responses provider against a specific endpoint that sets `reasoning.effort`.
+{-| A Responses provider against a specific endpoint that sets
+`reasoning.effort`.
 -}
 providerAtWithReasoningEffort : String -> Secret -> String -> ReasoningEffort -> Provider
 providerAtWithReasoningEffort endpoint apiKey model effort =
-    providerAtWithOptionalReasoningEffort endpoint apiKey model (Just effort)
+    providerAtWithOptions
+        endpoint
+        apiKey
+        model
+        { reasoningEffort = Just effort, hostedSkills = [] }
 
 
-providerAtWithOptionalReasoningEffort : String -> Secret -> String -> Maybe ReasoningEffort -> Provider
-providerAtWithOptionalReasoningEffort endpoint apiKey model effort =
-    Provider.custom (chatViaResponses endpoint apiKey model effort)
+{-| A hosted Responses provider with request options, including hosted Skills. -}
+providerWithOptions : Secret -> String -> RequestOptions -> Provider
+providerWithOptions apiKey model options =
+    providerAtWithOptions
+        "https://api.openai.com/v1/responses"
+        apiKey
+        model
+        options
 
 
-chatViaResponses : String -> Secret -> String -> Maybe ReasoningEffort -> List Message -> Task Error ChatResponse
-chatViaResponses endpoint apiKey model effort messages =
+{-| A Responses provider against a specific endpoint with request options. -}
+providerAtWithOptions : String -> Secret -> String -> RequestOptions -> Provider
+providerAtWithOptions endpoint apiKey model options =
+    Provider.custom (chatViaResponses endpoint apiKey model options)
+
+
+chatViaResponses : String -> Secret -> String -> RequestOptions -> List Message -> Task Error ChatResponse
+chatViaResponses endpoint apiKey model options messages =
     let
         req = Http.defaultRequest endpoint
     in
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
-            |> Http.withBody (encodeRequest model effort messages)
+            |> Http.withBody (encodeRequestWithOptions model options messages)
             |> Http.request
             |> Task.andThen
                    (\resp ->
@@ -127,6 +212,31 @@ chatViaResponses endpoint apiKey model effort messages =
                                        ++ resp.body)))
 
 
+{-| Upload a local Skill ZIP to OpenAI's
+ hosted Skills API.
+
+The ZIP is sent as the single `files` multipart field. `Http.withBody` transports
+raw bytes, and the body is assembled with `Sky.Core.Bytes`, so ZIP bytes are not
+interpreted as UTF-8 text. The local path is used only for reading and is never
+sent as a request filename.
+-}
+uploadSkillZip : Secret -> String -> Task Error UploadedSkill
+uploadSkillZip apiKey zipPath =
+    File.readFileBytes zipPath |> Task.andThen (uploadSkillBytes apiKey)
+
+
+uploadSkillBytes apiKey bytes =
+    Http.defaultRequest "https://api.openai.com/v1/skills"
+        |> Http.withMethod "POST"
+        |> Http.withBearer apiKey
+        |> Http.withHeader
+               "Content-Type"
+               ("multipart/form-data; boundary=" ++ skillUploadBoundary)
+        |> Http.withBody (encodeSkillUploadBody bytes)
+        |> Http.request
+        |> Task.andThen uploadResponse
+
+
 {-| Decode a raw OpenAI Responses API body into a `Provider.ChatResponse` — the
 assistant text (the `output_text` parts joined) and the token `usage`. Exposed
 so a caller can decode a body it fetched itself, and so the mapping is testable.
@@ -136,35 +246,155 @@ decodeResponse body =
     JsonD.decodeString responseDecoder body
 
 
-{-| Encode the Responses API request body.
+{-| Decode the JSON object returned by `uploadSkillZip`. Exposed for offline
+response-decoder tests and callers that fetch the upload response themselves.
+-}
+decodeUploadedSkill : String -> Result Error UploadedSkill
+decodeUploadedSkill body =
+    JsonD.decodeString uploadedSkillDecoder body
 
-Pass `Nothing` to omit `reasoning`, preserving the model default. The
-`providerWithReasoningEffort` constructors use `Just` internally.
+
+uploadResponse : Http.HttpResponse -> Task Error UploadedSkill
+uploadResponse resp =
+    if resp.status >= 200 && resp.status < 300 then
+        case decodeUploadedSkill resp.body of
+
+            Ok skill ->
+                Task.succeed skill
+
+            Err e ->
+                Task.fail e
+
+    else
+        Task.fail
+            (Error.unexpected
+                ("OpenAI Skills upload failed: HTTP "
+                    ++ String.fromInt resp.status))
+
+
+skillUploadBoundary : String
+skillUploadBoundary =
+    "SkyOpenAISkillUploadBoundary"
+
+
+{-| Build the raw multipart body for a ZIP Skill upload.
+
+The input is a `List Int` because that is the result of
+`File.readFileBytes`. `String.fromBytes` and `Sky.Core.Bytes` preserve each
+input value as one wire byte; `Bytes.append` then concatenates without any
+text encoding or rune-based slicing.
+-}
+encodeSkillUploadBody : List Int -> String
+encodeSkillUploadBody zipBytes =
+    let
+        zip = Bytes.fromString (String.fromBytes zipBytes)
+        prefix =
+            Bytes.fromString
+                ("--" ++ skillUploadBoundary
+                    ++ "\r\nContent-Disposition: form-data; name=\"files\"; filename=\"skill.zip\"\r\nContent-Type: application/zip\r\n\r\n")
+        suffix =
+            Bytes.fromString ("\r\n--" ++ skillUploadBoundary ++ "--\r\n")
+    in
+        Bytes.append prefix (Bytes.append zip suffix)
+
+
+{-| Encode the Responses API request body with legacy options. Passing `Nothing`
+to the old function omits `reasoning`, preserving the model default.
 -}
 encodeRequest : String -> Maybe ReasoningEffort -> List Message -> String
 encodeRequest model effort messages =
-    JsonE.encode
-        0
-        (JsonE.object
-            (case effort of
+    encodeRequestWithOptions
+        model
+        { reasoningEffort = effort, hostedSkills = [] }
+        messages
+
+
+{-| Encode a Responses API request body, including a hosted shell tool when
+`hostedSkills` is non-empty. Versions are sent as strings because that is the
+Skills API wire format (`"latest"` or a numeric version such as `"2"`).
+-}
+encodeRequestWithOptions : String -> RequestOptions -> List Message -> String
+encodeRequestWithOptions model options messages =
+    JsonE.encode 0 (JsonE.object (requestFields model options messages))
+
+
+requestFields : String -> RequestOptions -> List Message -> List ( String, JsonE.Value )
+requestFields model options messages =
+    let
+        base =
+            [ ( "model", JsonE.string model )
+            , ( "input", JsonE.list messageValue messages )
+            ]
+        withReasoning =
+            case options.reasoningEffort of
 
                 Just selectedEffort ->
-                    [ ( "model", JsonE.string model )
-                    , ( "input", JsonE.list messageValue messages )
-                    , ( "reasoning"
-                      , JsonE.object
-                            [ ( "effort"
-                              , JsonE.string
-                                    (reasoningEffortValue selectedEffort)
-                              )
-                            ]
-                      )
-                    ]
+                    base
+                        ++ [ ( "reasoning"
+                             , JsonE.object
+                                   [ ( "effort"
+                                     , JsonE.string
+                                           (reasoningEffortValue selectedEffort)
+                                     )
+                                   ]
+                             )
+                           ]
 
                 Nothing ->
-                    [ ( "model", JsonE.string model )
-                    , ( "input", JsonE.list messageValue messages )
-                    ]))
+                    base
+    in
+        case options.hostedSkills of
+
+            [] ->
+                withReasoning
+
+            skills ->
+                withReasoning
+                    ++ [ ( "tools", JsonE.list hostedShellTool [ skills ] ) ]
+
+
+hostedShellTool : List HostedSkill -> JsonE.Value
+hostedShellTool skills =
+    JsonE.object
+        [ ( "type", JsonE.string "shell" )
+        , ( "environment"
+          , JsonE.object
+                [ ( "type", JsonE.string "container_auto" )
+                , ( "skills", JsonE.list skillReference skills )
+                ]
+          )
+        ]
+
+
+skillReference : HostedSkill -> JsonE.Value
+skillReference skill =
+    case skill.version of
+
+        Nothing ->
+            JsonE.object
+                [ ( "type", JsonE.string "skill_reference" )
+                , ( "skill_id", JsonE.string skill.skillId )
+                ]
+
+        Just selectedVersion ->
+            JsonE.object
+                [ ( "type", JsonE.string "skill_reference" )
+                , ( "skill_id", JsonE.string skill.skillId )
+                , ( "version"
+                  , JsonE.string (skillVersionValue selectedVersion)
+                  )
+                ]
+
+
+skillVersionValue : SkillVersion -> String
+skillVersionValue version =
+    case version of
+
+        Latest ->
+            "latest"
+
+        Number n ->
+            String.fromInt n
 
 
 reasoningEffortValue : ReasoningEffort -> String
@@ -211,9 +441,9 @@ responseDecoder =
             ])
 
 
--- The Responses API returns an `output` array of items; a message item carries a
--- `content` array whose `output_text` parts hold the text. Concatenate them, so a
--- reasoning item or any non-text part contributes nothing rather than failing.
+-- The Responses API returns an `output` array of items; only a message item
+-- carries assistant text. A shell call/output, reasoning item, or other
+-- non-message item contributes nothing rather than failing the whole response.
 outputText =
     JsonD.oneOf
         [ JsonD.field "output" (JsonD.list itemText)
@@ -223,11 +453,19 @@ outputText =
 
 
 itemText =
-    JsonD.oneOf
-        [ JsonD.field "content" (JsonD.list partText)
-              |> JsonD.map (String.join "")
-        , JsonD.succeed ""
-        ]
+    JsonD.map2
+        (\ty content ->
+            if ty == "message" then
+                content
+
+            else
+                "")
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf
+            [ JsonD.field "content" (JsonD.list partText)
+                  |> JsonD.map (String.join "")
+            , JsonD.succeed ""
+            ])
 
 
 partText =
@@ -248,3 +486,19 @@ usageDecoder =
         (JsonD.oneOf [ JsonD.field "input_tokens" JsonD.int, JsonD.succeed 0 ])
         (JsonD.oneOf [ JsonD.field "output_tokens" JsonD.int, JsonD.succeed 0 ])
         (JsonD.oneOf [ JsonD.field "total_tokens" JsonD.int, JsonD.succeed 0 ])
+
+
+uploadedSkillDecoder =
+    JsonD.map5
+        (\id name description defaultVersion latestVersion ->
+            { id = id
+            , name = name
+            , description = description
+            , defaultVersion = defaultVersion
+            , latestVersion = latestVersion
+            })
+        (JsonD.field "id" JsonD.string)
+        (JsonD.field "name" JsonD.string)
+        (JsonD.field "description" JsonD.string)
+        (JsonD.field "default_version" JsonD.int)
+        (JsonD.field "latest_version" JsonD.int)

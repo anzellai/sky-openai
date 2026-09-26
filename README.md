@@ -64,6 +64,44 @@ reasoningProvider =
         Responses.High
 ```
 
+### Hosted Skills
+
+Upload a local Skill ZIP, retain the returned ID/version metadata, and attach it
+to a Responses provider. Execution happens in OpenAI's hosted shell; this package
+does not execute local shell commands.
+
+```elm
+import SkyOpenAI.Responses as Responses
+import Sky.Core.Secret as Secret
+import Sky.Core.Task as Task
+
+key = Secret.fromEnv "OPENAI_API_KEY"
+
+uploaded : Task Error Responses.UploadedSkill
+uploaded =
+    Responses.uploadSkillZip key "./csv_insights_skill.zip"
+
+skill : Responses.HostedSkill
+skill =
+    { skillId = "skill_..."
+    , version = Just (Responses.Number 2)
+    }
+
+providerWithSkill : Provider.Provider
+providerWithSkill =
+    Responses.providerWithOptions
+        key
+        "gpt-6-astra"
+        { reasoningEffort = Nothing
+        , hostedSkills = [ skill ]
+        }
+```
+
+Use `Nothing` for a Skill's default version, `Just Responses.Latest` to follow
+the latest version, or `Just (Responses.Number 2)` to pin a version. The ZIP upload
+must contain exactly one top-level Skill directory with one `SKILL.md` manifest.
+OpenAI documents limits of 50 MB compressed, 500 files, and 25 MB uncompressed.
+
 Chat Completions (also built into the stdlib as `Provider.openai`; exposed here
 so the whole OpenAI surface is in one package):
 
@@ -101,6 +139,9 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
   support it.
 - `SkyOpenAI.Responses.encodeRequest` / `decodeResponse` — encode or decode raw
   Responses API bodies yourself.
+- `SkyOpenAI.Responses.uploadSkillZip` — upload a ZIP Skill and decode its ID and
+  version pointers; `providerWithOptions` / `providerAtWithOptions` attach hosted
+  Skills through `container_auto`.
 
 ## Roadmap
 
