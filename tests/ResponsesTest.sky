@@ -6,9 +6,7 @@ No network.
 -}
 
 import Sky.Core.Prelude exposing (..)
-import Sky.Core.Bytes as Bytes
 import Sky.Core.Result exposing (Result(..))
-import Sky.Core.String as String
 import Sky.Test as Test exposing (Test)
 import SkyOpenAI.Responses as Responses
 import Std.Ai.Provider as Provider
@@ -19,24 +17,36 @@ sampleBody =
     "{\"id\":\"resp_1\",\"model\":\"gpt-4o-mini\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello there\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}"
 
 
-hostedShellBody : String
-hostedShellBody =
-    "{\"id\":\"resp_2\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"shell_call_output\",\"call_id\":\"call_1\",\"output\":\"generated output\"},{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"The skill ran.\"}]}]}"
+toolCallBody : String
+toolCallBody =
+    "{\"id\":\"resp_tool_1\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_weather\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}"
 
 
-uploadedSkillBody : String
-uploadedSkillBody =
-    "{\"id\":\"skill_123\",\"name\":\"csv-insights\",\"description\":\"Analyze CSV files.\",\"default_version\":1,\"latest_version\":2}"
+toolOptions : Responses.RequestOptions
+toolOptions =
+    { reasoningEffort = Nothing }
 
 
-hostedOptions : Responses.RequestOptions
-hostedOptions =
-    { reasoningEffort = Nothing
-    , hostedSkills =
-        [ { skillId = "skill_default", version = Nothing }
-        , { skillId = "skill_latest", version = Just Responses.Latest }
-        , { skillId = "skill_pinned", version = Just (Responses.Number 2) }
-        ]
+weatherTool : Provider.ToolSpec
+weatherTool =
+    { name = "weather", description = "Return current weather." }
+
+
+responsesToolCall : Provider.ToolCall
+responsesToolCall =
+    { id = "call_weather"
+    , name = "weather"
+    , arguments = "{\"city\":\"Berlin\"}"
+    , continuation = Just "sky-openai-responses:resp_tool_1"
+    }
+
+
+foreignToolCall : Provider.ToolCall
+foreignToolCall =
+    { id = "call_weather"
+    , name = "weather"
+    , arguments = "{\"city\":\"Berlin\"}"
+    , continuation = Just "other-provider:response_1"
     }
 
 
@@ -70,32 +80,6 @@ tests =
                         Err _ ->
                             Test.fail "decode failed")
           , Test.test
-                "preserves arbitrary ZIP bytes in multipart upload body"
-                (\_ ->
-                    Test.equal
-                        True
-                        (String.contains
-                            "00ff01c8"
-                            (Bytes.toHex
-                                (Responses.encodeSkillUploadBody
-                                    [ 0, 255, 1, 200 ]))))
-          , Test.test
-                "decodes uploaded Skill metadata"
-                (\_ ->
-                    case Responses.decodeUploadedSkill uploadedSkillBody of
-
-                        Ok skill ->
-                            Test.equal
-                                ( "skill_123", "csv-insights", 1, 2 )
-                                ( skill.id
-                                , skill.name
-                                , skill.defaultVersion
-                                , skill.latestVersion
-                                )
-
-                        Err _ ->
-                            Test.fail "decode failed")
-          , Test.test
                 "omits reasoning when it is not configured"
                 (\_ ->
                     Test.equal
@@ -104,24 +88,6 @@ tests =
                             "gpt-5.6-luna"
                             Nothing
                             [ Provider.user "Solve it." ]))
-          , Test.test
-                "encodes hosted Skills as a hosted shell tool"
-                (\_ ->
-                    Test.equal
-                        "{\"model\":\"gpt-6-astra\",\"input\":[{\"role\":\"user\",\"content\":\"Use the skill.\"}],\"tools\":[{\"type\":\"shell\",\"environment\":{\"type\":\"container_auto\",\"skills\":[{\"type\":\"skill_reference\",\"skill_id\":\"skill_default\"},{\"type\":\"skill_reference\",\"skill_id\":\"skill_latest\",\"version\":\"latest\"},{\"type\":\"skill_reference\",\"skill_id\":\"skill_pinned\",\"version\":\"2\"}]}}]}"
-                        (Responses.encodeRequestWithOptions
-                            "gpt-6-astra"
-                            hostedOptions
-                            [ Provider.user "Use the skill." ]))
-          , Test.test
-                "does not add tools for empty hosted Skills"
-                (\_ ->
-                    Test.equal
-                        "{\"model\":\"gpt-6-astra\",\"input\":[{\"role\":\"user\",\"content\":\"Use the skill.\"}]}"
-                        (Responses.encodeRequestWithOptions
-                            "gpt-6-astra"
-                            { reasoningEffort = Nothing, hostedSkills = [] }
-                            [ Provider.user "Use the skill." ]))
           , Test.test
                 "encodes every GPT-5.6 Luna reasoning effort"
                 (\_ ->
@@ -155,5 +121,60 @@ tests =
                             "reasoning-model"
                             (Just Responses.Minimal)
                             [ Provider.user "Solve it." ]))
+          , Test.test
+                "decodes Responses function calls with a continuation"
+                (\_ ->
+                    case Responses.decodeToolResponse toolCallBody of
+
+                        Ok response ->
+                            Test.equal
+                                ( "", [ responsesToolCall ], ( 12, 3, 15 ) )
+                                ( response.content
+                                , response.toolCalls
+                                , ( response.usage.promptTokens
+                                  , response.usage.completionTokens
+                                  , response.usage.totalTokens
+                                  )
+                                )
+
+                        Err _ ->
+                            Test.fail "decode failed")
+          , Test.test
+                "encodes local functions as flat Responses tools"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Weather in Berlin?\"}],\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            ]
+                            [ weatherTool ]))
+          , Test.test
+                "continues Responses tool results with previous_response_id"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"type\":\"function_call_output\",\"call_id\":\"call_weather\",\"output\":\"18 C\"}],\"previous_response_id\":\"resp_tool_1\",\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            , Provider.Called [ responsesToolCall ]
+                            , Provider.Returned responsesToolCall "18 C"
+                            ]
+                            [ weatherTool ]))
+          , Test.test
+                "replays tool turns for a foreign continuation"
+                (\_ ->
+                    Test.equal
+                        "{\"model\":\"gpt-5.6-luna\",\"input\":[{\"role\":\"user\",\"content\":\"Weather in Berlin?\"},{\"type\":\"function_call\",\"call_id\":\"call_weather\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\"},{\"type\":\"function_call_output\",\"call_id\":\"call_weather\",\"output\":\"18 C\"}],\"tools\":[{\"type\":\"function\",\"name\":\"weather\",\"description\":\"Return current weather.\",\"parameters\":{\"type\":\"object\"},\"strict\":false}]}"
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            , Provider.Called [ foreignToolCall ]
+                            , Provider.Returned foreignToolCall "18 C"
+                            ]
+                            [ weatherTool ]))
           ]
     ]
