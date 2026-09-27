@@ -9,20 +9,17 @@ It gives you two `Std.Ai.Provider.Provider` backends:
 Both return an ordinary `Provider`, so they compose with `Std.Ai.Agent`,
 `Std.Ai.Policy`, `Std.Ai.Trace`, and `cost` exactly like a built-in provider.
 
-The package is built entirely on `Std.Ai.Provider.custom`, the stdlib extension
-point. Provider-specific logic lives here, not in the Sky stdlib, which stays
-vendor-neutral. This repo is the reference use case for `Provider.custom`: it
-shows how to add a new backend, wire format, or API to Sky without any compiler
-or stdlib change.
+The Responses provider is built on `Std.Ai.Provider.customTools`; Chat is a thin
+alias over the stdlib provider. Provider-specific wire logic lives here, while the
+stdlib stays vendor-neutral.
 
 ## Requirements
 
-You need a Sky toolchain that includes `Std.Ai.Provider.custom`. That is Sky
-**after** v0.25.6. On an older Sky the package will not resolve `Provider.custom`.
-Check with:
+You need a Sky toolchain that includes `Std.Ai.Provider.customTools` and
+`ToolCall.continuation`. Check with:
 
 ```bash
-sky doc Std.Ai.Provider | grep custom
+sky doc Std.Ai.Provider | grep customTools
 ```
 
 ## Install
@@ -64,43 +61,14 @@ reasoningProvider =
         Responses.High
 ```
 
-### Hosted Skills
 
-Upload a local Skill ZIP, retain the returned ID/version metadata, and attach it
-to a Responses provider. Execution happens in OpenAI's hosted shell; this package
-does not execute local shell commands.
+### Native local tools
 
-```elm
-import SkyOpenAI.Responses as Responses
-import Sky.Core.Secret as Secret
-import Sky.Core.Task as Task
-
-key = Secret.fromEnv "OPENAI_API_KEY"
-
-uploaded : Task Error Responses.UploadedSkill
-uploaded =
-    Responses.uploadSkillZip key "./csv_insights_skill.zip"
-
-skill : Responses.HostedSkill
-skill =
-    { skillId = "skill_..."
-    , version = Just (Responses.Number 2)
-    }
-
-providerWithSkill : Provider.Provider
-providerWithSkill =
-    Responses.providerWithOptions
-        key
-        "gpt-6-astra"
-        { reasoningEffort = Nothing
-        , hostedSkills = [ skill ]
-        }
-```
-
-Use `Nothing` for a Skill's default version, `Just Responses.Latest` to follow
-the latest version, or `Just (Responses.Number 2)` to pin a version. The ZIP upload
-must contain exactly one top-level Skill directory with one `SKILL.md` manifest.
-OpenAI documents limits of 50 MB compressed, 500 files, and 25 MB uncompressed.
+`Responses.provider` also works with `Agent.nativeToolLoop`. It advertises each
+`Std.Ai.Tool` as a flat Responses `function` tool, executes it locally through the
+stdlib loop, and sends tool results back with `previous_response_id`. Tool arguments
+remain the JSON string passed to the tool's `exec`; the current `Tool` contract only
+supplies a name and description, so its function schema is a permissive object.
 
 Chat Completions (also built into the stdlib as `Provider.openai`; exposed here
 so the whole OpenAI surface is in one package):
@@ -138,18 +106,16 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
   `providerAtWithReasoningEffort` — opt into `reasoning.effort` for models that
   support it.
 - `SkyOpenAI.Responses.encodeRequest` / `decodeResponse` — encode or decode raw
-  Responses API bodies yourself.
-- `SkyOpenAI.Responses.uploadSkillZip` — upload a ZIP Skill and decode its ID and
-  version pointers; `providerWithOptions` / `providerAtWithOptions` attach hosted
-  Skills through `container_auto`.
+  plain-chat Responses API bodies yourself.
+- `SkyOpenAI.Responses.encodeToolRequest` / `decodeToolResponse` — encode and
+  decode native function-calling requests and responses. Provider-owned
+  continuations use `previous_response_id` after a tool call.
+
 
 ## Roadmap
 
-Each item stays inside this package, no stdlib change:
-
-- Stateful chaining with `previous_response_id`.
-- The server-side built-in tools (web_search, file_search, code_interpreter).
-- Native function-calling, via `Std.Ai.Provider.customTools`.
+- Server-side built-in tools (`web_search`, `file_search`, `code_interpreter`).
+- Stateful chaining for ordinary chat, outside `Agent.nativeToolLoop`.
 
 ## Test
 
@@ -157,7 +123,7 @@ Each item stays inside this package, no stdlib change:
 sky test tests/ResponsesTest.sky
 ```
 
-The tests decode a canonical Responses body offline. No network, no key.
+The tests encode and decode Responses bodies offline. No network, no key.
 
 ## Licence
 
