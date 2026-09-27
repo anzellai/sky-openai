@@ -85,6 +85,11 @@ type alias ResponseFunctionCall =
     }
 
 
+openAiHttpTimeoutMs : Int
+openAiHttpTimeoutMs =
+    60000
+
+
 {-| A Responses provider against the hosted OpenAI endpoint.
 
 This leaves `reasoning.effort` unset, so OpenAI selects the model default.
@@ -157,6 +162,7 @@ chatViaResponses endpoint apiKey model options messages =
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
             |> Http.withBody (encodeRequestWithOptions model options messages)
+            |> Http.withTimeout openAiHttpTimeoutMs
             |> Http.request
             |> Task.andThen
                    (\resp ->
@@ -186,6 +192,7 @@ chatToolsViaResponses endpoint apiKey model options turns tools =
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
             |> Http.withBody (encodeToolRequest model options turns tools)
+            |> Http.withTimeout openAiHttpTimeoutMs
             |> Http.request
             |> Task.andThen handleToolResponse
 
