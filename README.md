@@ -21,8 +21,7 @@ v0.26.0. On an older Sky the package fails to compile (`ToolCall` has no
 `continuation` field). Check with:
 
 ```bash
-sky --version
-sky doc Std.Ai.Provider | grep continuation
+sky --version   # sky v0.26.0 or later
 ```
 
 ## Install
