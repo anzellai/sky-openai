@@ -15,11 +15,14 @@ stdlib stays vendor-neutral.
 
 ## Requirements
 
-You need a Sky toolchain that includes `Std.Ai.Provider.customTools` and
-`ToolCall.continuation`. Check with:
+You need **Sky v0.26.0 or later**: tool calling over the Responses API uses
+`Std.Ai.Provider.customTools` and `ToolCall.continuation`, which first shipped in
+v0.26.0. On an older Sky the package fails to compile (`ToolCall` has no
+`continuation` field). Check with:
 
 ```bash
-sky doc Std.Ai.Provider | grep customTools
+sky --version
+sky doc Std.Ai.Provider | grep continuation
 ```
 
 ## Install
