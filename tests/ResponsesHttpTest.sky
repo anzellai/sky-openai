@@ -1,0 +1,218 @@
+module ResponsesHttpTest exposing (tests)
+
+{-| Provider-level HTTP tests. Each test starts and closes a Python standard-library
+loopback fixture; no external API or real credentials are used.
+-}
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Error as Error
+import Sky.Core.List as List
+import Sky.Core.Process as Process
+import Sky.Core.Secret as Secret
+import Sky.Core.String as String
+import Sky.Core.System as System
+import Sky.Core.Task as Task
+import Sky.Test as Test exposing (Test)
+import SkyOpenAI.Responses as Responses
+import Std.Ai.Provider as Provider
+
+
+withProvider : String -> (Provider.Provider -> Task Error a) -> (Result Error a -> Test.TestResult) -> Test.TestResult
+withProvider path request expect =
+    let
+        result =
+            Process.command "python3"
+                |> Process.withArgs [ "tests/http_fixture.py" ]
+                |> Process.spawn
+                |> Task.andThen (withFixture path request expect)
+                |> Task.run
+    in
+        case result of
+
+            Ok assertion ->
+                assertion
+
+            Err error ->
+                Test.fail (Error.toString error)
+
+
+withFixture : String -> (Provider.Provider -> Task Error a) -> (Result Error a -> Test.TestResult) -> Process.Process -> Task Error Test.TestResult
+withFixture path request expect fixture =
+    Process.readWithin 5000 fixture Process.Stdout 0
+        |> Task.andThen (requestAtFixture path request expect)
+        |> Task.onError
+               (\error -> Task.succeed (Test.fail (Error.toString error)))
+        |> Task.andThen
+               (\assertion -> Process.close fixture |> Task.map (\_ -> assertion))
+
+
+requestAtFixture : String -> (Provider.Provider -> Task Error a) -> (Result Error a -> Test.TestResult) -> Process.Chunk -> Task Error Test.TestResult
+requestAtFixture path request expect chunk =
+    let
+        root = String.trim chunk.data
+        provider =
+            Responses.providerAtWithOptions
+                (root ++ path)
+                (Secret.unsafeFromString "sky-openai-test-key")
+                "fixture-model"
+                { reasoningEffort = Just Responses.High }
+    in
+        if String.startsWith "http://127.0.0.1:" root then
+            prepareHttp root |> Task.andThen (\_ -> request provider)
+                |> Task.map (\response -> expect (Ok response))
+                |> Task.onError (\error -> Task.succeed (expect (Err error)))
+
+        else
+            Task.fail
+                (Error.unexpected
+                    "HTTP fixture did not announce its loopback URL within 5 seconds.")
+
+
+prepareHttp : String -> Task Error ()
+prepareHttp root =
+    -- Bypass native response mocks so the fixture sees headers; proxy all other
+    -- hosts to the fixture, which rejects them without external network access.
+    Task.sequence
+        [ System.setenv "SKY_TEST_MODE" "0"
+        , System.setenv "HTTP_PROXY" root
+        , System.setenv "HTTPS_PROXY" root
+        , System.setenv "NO_PROXY" "127.0.0.1,localhost"
+        ]
+        |> Task.map (\_ -> ())
+
+
+chat : Provider.Provider -> Task Error Provider.ChatResponse
+chat provider =
+    Provider.chat
+        provider
+        [ Provider.system "Be precise.", Provider.user "Weather in Berlin?" ]
+
+
+weatherTool : Provider.ToolSpec
+weatherTool =
+    { name = "weather", description = "Return current weather." }
+
+
+initialTurns : List Provider.Turn
+initialTurns =
+    [ Provider.Say (Provider.system "Be precise.")
+    , Provider.Say (Provider.user "Weather in Berlin?")
+    ]
+
+
+chatTools : Provider.Provider -> Task Error Provider.ToolResponse
+chatTools provider =
+    Provider.chatTools provider initialTurns [ weatherTool ]
+
+
+continueTools : Provider.Provider -> Task Error Provider.ToolResponse
+continueTools provider =
+    chatTools provider |> Task.andThen (submitToolResults provider)
+
+
+submitToolResults : Provider.Provider -> Provider.ToolResponse -> Task Error Provider.ToolResponse
+submitToolResults provider response =
+    Provider.chatTools
+        provider
+        (initialTurns ++ [ Provider.Called response.toolCalls ]
+            ++ List.map
+                   (\call -> Provider.Returned call "18 C")
+                   response.toolCalls)
+        [ weatherTool ]
+
+
+expectHttpError : String -> Result Error a -> Test.TestResult
+expectHttpError context result =
+    Test.equal
+        (Err
+            (Error.unexpected
+                (context
+                    ++ ": HTTP 429 — {\"error\":{\"message\":\"fixture rate limit\"}}")))
+        result
+
+
+failureTests : String -> String -> (Provider.Provider -> Task Error a) -> List Test
+failureTests path context request =
+    [ Test.test
+          (path ++ " preserves HTTP status, body, and error context")
+          (\_ ->
+              withProvider
+                  (path ++ "/http-error")
+                  request
+                  (expectHttpError context))
+    , Test.test
+          (path ++ " propagates malformed successful JSON as a decode error")
+          (\_ ->
+              withProvider
+                  (path ++ "/malformed")
+                  request
+                  (Test.expectErrorKind Error.Decode))
+    , Test.test
+          (path ++ " propagates a disconnected transport as a network error")
+          (\_ ->
+              withProvider
+                  (path ++ "/disconnect")
+                  request
+                  (Test.expectErrorKind Error.Network))
+    ]
+
+
+tests : List Test
+tests =
+    [ Test.test
+          "HTTP chat sends the configured request and decodes a non-200 success"
+          (\_ ->
+              withProvider
+                  "/chat"
+                  chat
+                  (Test.equal
+                      (Ok
+                          { content = "Hello there"
+                          , usage =
+                              { promptTokens = 12
+                              , completionTokens = 3
+                              , totalTokens = 15
+                              }
+                          })))
+    , Test.test
+          "HTTP tools sends native specs and decodes text, calls, continuation, and usage"
+          (\_ ->
+              withProvider
+                  "/tools"
+                  chatTools
+                  (Test.equal
+                      (Ok
+                          { content = "Checking weather."
+                          , toolCalls =
+                              [ { id = "call_weather"
+                                , name = "weather"
+                                , arguments = "{\"city\":\"Berlin\"}"
+                                , continuation =
+                                    Just "sky-openai-responses:resp_http_tool"
+                                }
+                              ]
+                          , usage =
+                              { promptTokens = 12
+                              , completionTokens = 3
+                              , totalTokens = 15
+                              }
+                          })))
+    , Test.test
+          "HTTP tool loop submits decoded continuation and tool results to the same endpoint"
+          (\_ ->
+              withProvider
+                  "/tools/loop"
+                  continueTools
+                  (Test.equal
+                      (Ok
+                          { content = "It is 18 C."
+                          , toolCalls = []
+                          , usage =
+                              { promptTokens = 12
+                              , completionTokens = 3
+                              , totalTokens = 15
+                              }
+                          })))
+    ]
+        ++ failureTests "/chat" "OpenAI Responses failed" chat
+        ++ failureTests "/tools" "OpenAI Responses tools failed" chatTools

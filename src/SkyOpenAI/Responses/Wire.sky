@@ -1,0 +1,78 @@
+module SkyOpenAI.Responses.Wire exposing (messageValue, outputText, responseUsageDecoder)
+
+{-| Wire-format primitives shared by `SkyOpenAI.Responses` (plain chat) and
+`SkyOpenAI.Responses.ToolCalling` (native function calling). Both encode a
+plain chat message the same way and decode the same Responses API `output`
+item shape and `usage` object.
+-}
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.String as String
+import Sky.Core.Json.Encode as JsonE
+import Sky.Core.Json.Decode as JsonD
+import Std.Ai.Provider as Provider
+
+
+{-| Encode a plain chat message as a Responses `input` item. -}
+messageValue : Provider.Message -> JsonE.Value
+messageValue m =
+    JsonE.object
+        [ ( "role", JsonE.string m.role )
+        , ( "content", JsonE.string m.content )
+        ]
+
+
+-- The Responses API returns an `output` array of items; only a message item
+-- carries assistant text. A reasoning item or other non-message item contributes
+-- nothing rather than failing the whole response.
+outputText =
+    JsonD.oneOf
+        [ JsonD.field "output" (JsonD.list itemText)
+              |> JsonD.map (String.join "")
+        , JsonD.succeed ""
+        ]
+
+
+itemText =
+    JsonD.map2
+        (\ty content ->
+            if ty == "message" then
+                content
+
+            else
+                "")
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf
+            [ JsonD.field "content" (JsonD.list partText)
+                  |> JsonD.map (String.join "")
+            , JsonD.succeed ""
+            ])
+
+
+partText =
+    JsonD.map2
+        (\ty txt ->
+            if ty == "output_text" then
+                txt
+
+            else
+                "")
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "text" JsonD.string, JsonD.succeed "" ])
+
+
+{-| Decode a Responses `usage` object, defaulting every field to 0 when absent. -}
+responseUsageDecoder =
+    JsonD.oneOf
+        [ JsonD.field "usage" usageDecoder
+        , JsonD.succeed
+              { promptTokens = 0, completionTokens = 0, totalTokens = 0 }
+        ]
+
+
+usageDecoder =
+    JsonD.map3
+        (\i o t -> { promptTokens = i, completionTokens = o, totalTokens = t })
+        (JsonD.oneOf [ JsonD.field "input_tokens" JsonD.int, JsonD.succeed 0 ])
+        (JsonD.oneOf [ JsonD.field "output_tokens" JsonD.int, JsonD.succeed 0 ])
+        (JsonD.oneOf [ JsonD.field "total_tokens" JsonD.int, JsonD.succeed 0 ])

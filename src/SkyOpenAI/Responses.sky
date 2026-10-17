@@ -43,11 +43,12 @@ import Sky.Core.Prelude exposing (..)
 import Sky.Core.Task as Task
 import Sky.Core.Error as Error
 import Sky.Core.String as String
-import Sky.Core.List as List
 import Sky.Core.Secret exposing (Secret)
 import Sky.Core.Http as Http
 import Sky.Core.Json.Encode as JsonE
 import Sky.Core.Json.Decode as JsonD
+import SkyOpenAI.Responses.ToolCalling as ToolCalling
+import SkyOpenAI.Responses.Wire exposing (messageValue, outputText, responseUsageDecoder)
 import Std.Ai.Provider as Provider exposing (ChatResponse, Message, Provider)
 
 {-| The documented `reasoning.effort` values for a Responses request.
@@ -67,22 +68,6 @@ type ReasoningEffort
 {-| Optional Responses provider behavior. -}
 type alias RequestOptions =
     { reasoningEffort : Maybe ReasoningEffort }
-
-type alias CallBatch =
-    { calls : List Provider.ToolCall
-    , following : List Provider.Turn
-    }
-
-type alias ContinuationContext =
-    { responseId : String
-    , following : List Provider.Turn
-    }
-
-type alias ResponseFunctionCall =
-    { id : String
-    , name : String
-    , arguments : String
-    }
 
 
 openAiHttpTimeoutMs : Int
@@ -156,51 +141,43 @@ providerAtWithOptions endpoint apiKey model options =
 
 chatViaResponses : String -> Secret -> String -> RequestOptions -> List Message -> Task Error ChatResponse
 chatViaResponses endpoint apiKey model options messages =
-    let
-        req = Http.defaultRequest endpoint
-    in
-        { req | method = "POST" } |> Http.withBearer apiKey
-            |> Http.withHeader "Content-Type" "application/json"
-            |> Http.withBody (encodeRequestWithOptions model options messages)
-            |> Http.withTimeout openAiHttpTimeoutMs
-            |> Http.request
-            |> Task.andThen
-                   (\resp ->
-                       if resp.status >= 200 && resp.status < 300 then
-                           case JsonD.decodeString responseDecoder resp.body of
-
-                               Ok r ->
-                                   Task.succeed r
-
-                               Err e ->
-                                   Task.fail e
-
-                       else
-                           Task.fail
-                               (Error.unexpected
-                                   ("OpenAI Responses failed: HTTP "
-                                       ++ String.fromInt resp.status
-                                       ++ " — "
-                                       ++ resp.body)))
+    postJson
+        endpoint
+        apiKey
+        (encodeRequestWithOptions model options messages)
+        "OpenAI Responses failed"
+        decodeResponse
 
 
 chatToolsViaResponses : String -> Secret -> String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> Task Error Provider.ToolResponse
 chatToolsViaResponses endpoint apiKey model options turns tools =
+    postJson
+        endpoint
+        apiKey
+        (ToolCalling.encodeToolRequest
+            model
+            (encodedReasoningEffort options)
+            turns
+            tools)
+        "OpenAI Responses tools failed"
+        ToolCalling.decodeToolResponse
+
+
+postJson endpoint apiKey body errorContext decoder =
     let
         req = Http.defaultRequest endpoint
     in
         { req | method = "POST" } |> Http.withBearer apiKey
             |> Http.withHeader "Content-Type" "application/json"
-            |> Http.withBody (encodeToolRequest model options turns tools)
+            |> Http.withBody body
             |> Http.withTimeout openAiHttpTimeoutMs
             |> Http.request
-            |> Task.andThen handleToolResponse
+            |> Task.andThen (handleHttpResponse errorContext decoder)
 
 
-handleToolResponse : Http.HttpResponse -> Task Error Provider.ToolResponse
-handleToolResponse resp =
+handleHttpResponse errorContext decoder resp =
     if resp.status >= 200 && resp.status < 300 then
-        case decodeToolResponse resp.body of
+        case decoder resp.body of
 
             Ok response ->
                 Task.succeed response
@@ -211,9 +188,7 @@ handleToolResponse resp =
     else
         Task.fail
             (Error.unexpected
-                ("OpenAI Responses tools failed: HTTP "
-                    ++ String.fromInt resp.status
-                    ++ " — "
+                (errorContext ++ ": HTTP " ++ String.fromInt resp.status ++ " — "
                     ++ resp.body))
 
 
@@ -232,7 +207,7 @@ opaque continuation for the next tool-result request.
 -}
 decodeToolResponse : String -> Result Error Provider.ToolResponse
 decodeToolResponse body =
-    JsonD.decodeString toolResponseDecoder body
+    ToolCalling.decodeToolResponse body
 
 
 {-| Encode the Responses API request body with legacy options. Passing `Nothing`
@@ -255,238 +230,11 @@ call; all other histories are replayed as Responses input items.
 -}
 encodeToolRequest : String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> String
 encodeToolRequest model options turns toolSpecs =
-    JsonE.encode
-        0
-        (JsonE.object (toolRequestFields model options turns toolSpecs))
-
-
-toolRequestFields : String -> RequestOptions -> List Provider.Turn -> List Provider.ToolSpec -> List ( String, JsonE.Value )
-toolRequestFields model options turns toolSpecs =
-    let
-        continuation = continuationContext turns
-        input =
-            case continuation of
-
-                Just context ->
-                    inputValues context.following
-
-                Nothing ->
-                    inputValues turns
-        base =
-            [ ( "model", JsonE.string model )
-            , ( "input", JsonE.list identity input )
-            ]
-        withContinuation =
-            case continuation of
-
-                Just context ->
-                    base
-                        ++ [ ( "previous_response_id"
-                             , JsonE.string context.responseId
-                             )
-                           ]
-
-                Nothing ->
-                    base
-        withReasoning =
-            case options.reasoningEffort of
-
-                Just selectedEffort ->
-                    withContinuation
-                        ++ [ ( "reasoning"
-                             , JsonE.object
-                                   [ ( "effort"
-                                     , JsonE.string
-                                           (reasoningEffortValue selectedEffort)
-                                     )
-                                   ]
-                             )
-                           ]
-
-                Nothing ->
-                    withContinuation
-        tools = requestToolValues toolSpecs
-    in
-        if List.isEmpty tools then
-            withReasoning
-
-        else
-            withReasoning ++ [ ( "tools", JsonE.list identity tools ) ]
-
-
-inputValues : List Provider.Turn -> List JsonE.Value
-inputValues turns =
-    List.concatMap turnInputValues turns
-
-
-turnInputValues : Provider.Turn -> List JsonE.Value
-turnInputValues turn =
-    case turn of
-
-        Provider.Say message ->
-            [ messageValue message ]
-
-        Provider.Called calls ->
-            List.map functionCallInputValue calls
-
-        Provider.Returned call output ->
-            [ functionCallOutputValue call output ]
-
-
-functionCallInputValue : Provider.ToolCall -> JsonE.Value
-functionCallInputValue call =
-    JsonE.object
-        [ ( "type", JsonE.string "function_call" )
-        , ( "call_id", JsonE.string call.id )
-        , ( "name", JsonE.string call.name )
-        , ( "arguments", JsonE.string call.arguments )
-        ]
-
-
-functionCallOutputValue : Provider.ToolCall -> String -> JsonE.Value
-functionCallOutputValue call output =
-    JsonE.object
-        [ ( "type", JsonE.string "function_call_output" )
-        , ( "call_id", JsonE.string call.id )
-        , ( "output", JsonE.string output )
-        ]
-
-
-requestToolValues : List Provider.ToolSpec -> List JsonE.Value
-requestToolValues toolSpecs =
-    List.map functionToolValue toolSpecs
-
-
-functionToolValue : Provider.ToolSpec -> JsonE.Value
-functionToolValue tool =
-    JsonE.object
-        [ ( "type", JsonE.string "function" )
-        , ( "name", JsonE.string tool.name )
-        , ( "description", JsonE.string tool.description )
-        , ( "parameters", JsonE.object [ ( "type", JsonE.string "object" ) ] )
-        , ( "strict", JsonE.bool False )
-        ]
-
-
-responsesContinuationPrefix : String
-responsesContinuationPrefix =
-    "sky-openai-responses:"
-
-
-continuationContext : List Provider.Turn -> Maybe ContinuationContext
-continuationContext turns =
-    case latestCallBatch turns of
-
-        Just batch ->
-            case commonResponseId batch.calls of
-
-                Just responseId ->
-                    Just
-                        { responseId = responseId, following = batch.following }
-
-                Nothing ->
-                    Nothing
-
-        Nothing ->
-            Nothing
-
-
-latestCallBatch : List Provider.Turn -> Maybe CallBatch
-latestCallBatch turns =
-    latestCallBatchHelp Nothing turns
-
-
-latestCallBatchHelp : Maybe CallBatch -> List Provider.Turn -> Maybe CallBatch
-latestCallBatchHelp latest turns =
-    case turns of
-
-        [] ->
-            latest
-
-        turn :: rest ->
-            case turn of
-
-                Provider.Called calls ->
-                    latestCallBatchHelp
-                        (Just { calls = calls, following = [] })
-                        rest
-
-                _ ->
-                    case latest of
-
-                        Just batch ->
-                            latestCallBatchHelp
-                                (Just
-                                    { batch | following = batch.following ++ [ turn ]
-                                    })
-                                rest
-
-                        Nothing ->
-                            latestCallBatchHelp Nothing rest
-
-
-commonResponseId : List Provider.ToolCall -> Maybe String
-commonResponseId calls =
-    case calls of
-
-        [] ->
-            Nothing
-
-        call :: rest ->
-            case responseIdForCall call of
-
-                Just responseId ->
-                    if allCallsUseResponse responseId rest then
-                        Just responseId
-
-                    else
-                        Nothing
-
-                Nothing ->
-                    Nothing
-
-
-allCallsUseResponse : String -> List Provider.ToolCall -> Bool
-allCallsUseResponse responseId calls =
-    case calls of
-
-        [] ->
-            True
-
-        call :: rest ->
-            case responseIdForCall call of
-
-                Just callResponseId ->
-                    callResponseId == responseId
-                        && allCallsUseResponse responseId rest
-
-                Nothing ->
-                    False
-
-
-responseIdForCall : Provider.ToolCall -> Maybe String
-responseIdForCall call =
-    case call.continuation of
-
-        Just continuation ->
-            if String.startsWith responsesContinuationPrefix continuation then
-                let
-                    responseId =
-                        String.dropLeft
-                            (String.length responsesContinuationPrefix)
-                            continuation
-                in
-                    if String.isEmpty responseId then
-                        Nothing
-
-                    else
-                        Just responseId
-
-            else
-                Nothing
-
-        Nothing ->
-            Nothing
+    ToolCalling.encodeToolRequest
+        model
+        (encodedReasoningEffort options)
+        turns
+        toolSpecs
 
 
 requestFields : String -> RequestOptions -> List Message -> List ( String, JsonE.Value )
@@ -497,17 +245,13 @@ requestFields model options messages =
             , ( "input", JsonE.list messageValue messages )
             ]
         withReasoning =
-            case options.reasoningEffort of
+            case encodedReasoningEffort options of
 
-                Just selectedEffort ->
+                Just effort ->
                     base
                         ++ [ ( "reasoning"
                              , JsonE.object
-                                   [ ( "effort"
-                                     , JsonE.string
-                                           (reasoningEffortValue selectedEffort)
-                                     )
-                                   ]
+                                   [ ( "effort", JsonE.string effort ) ]
                              )
                            ]
 
@@ -515,6 +259,17 @@ requestFields model options messages =
                     base
     in
         withReasoning
+
+
+encodedReasoningEffort : RequestOptions -> Maybe String
+encodedReasoningEffort options =
+    case options.reasoningEffort of
+
+        Just effort ->
+            Just (reasoningEffortValue effort)
+
+        Nothing ->
+            Nothing
 
 
 reasoningEffortValue : ReasoningEffort -> String
@@ -543,127 +298,8 @@ reasoningEffortValue effort =
             "max"
 
 
-messageValue m =
-    JsonE.object
-        [ ( "role", JsonE.string m.role )
-        , ( "content", JsonE.string m.content )
-        ]
-
-
 responseDecoder =
     JsonD.map2
         (\content usage -> { content = content, usage = usage })
         outputText
         responseUsageDecoder
-
-
-toolResponseDecoder =
-    JsonD.map4
-        (\responseId content calls usage ->
-            { content = content
-            , toolCalls = List.map (toolCallWithContinuation responseId) calls
-            , usage = usage
-            })
-        responseIdDecoder
-        outputText
-        functionCalls
-        responseUsageDecoder
-
-
-responseIdDecoder =
-    JsonD.oneOf [ JsonD.field "id" JsonD.string, JsonD.succeed "" ]
-
-
-responseUsageDecoder =
-    JsonD.oneOf
-        [ JsonD.field "usage" usageDecoder
-        , JsonD.succeed
-              { promptTokens = 0, completionTokens = 0, totalTokens = 0 }
-        ]
-
-
-functionCalls =
-    JsonD.oneOf
-        [ JsonD.field "output" (JsonD.list functionCallItem)
-              |> JsonD.map (List.filterMap (\item -> item))
-        , JsonD.succeed []
-        ]
-
-
-functionCallItem =
-    JsonD.map4
-        (\itemType callId name arguments ->
-            if itemType == "function_call" then
-                Just { id = callId, name = name, arguments = arguments }
-
-            else
-                Nothing)
-        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
-        (JsonD.oneOf [ JsonD.field "call_id" JsonD.string, JsonD.succeed "" ])
-        (JsonD.oneOf [ JsonD.field "name" JsonD.string, JsonD.succeed "" ])
-        (JsonD.oneOf [ JsonD.field "arguments" JsonD.string, JsonD.succeed "" ])
-
-
-toolCallWithContinuation : String -> ResponseFunctionCall -> Provider.ToolCall
-toolCallWithContinuation responseId call =
-    { id = call.id
-    , name = call.name
-    , arguments = call.arguments
-    , continuation = continuationForResponse responseId
-    }
-
-
-continuationForResponse : String -> Maybe String
-continuationForResponse responseId =
-    if String.isEmpty responseId then
-        Nothing
-
-    else
-        Just (responsesContinuationPrefix ++ responseId)
-
-
--- The Responses API returns an `output` array of items; only a message item
--- carries assistant text. A reasoning item or other non-message item contributes
--- nothing rather than failing the whole response.
-outputText =
-    JsonD.oneOf
-        [ JsonD.field "output" (JsonD.list itemText)
-              |> JsonD.map (String.join "")
-        , JsonD.succeed ""
-        ]
-
-
-itemText =
-    JsonD.map2
-        (\ty content ->
-            if ty == "message" then
-                content
-
-            else
-                "")
-        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
-        (JsonD.oneOf
-            [ JsonD.field "content" (JsonD.list partText)
-                  |> JsonD.map (String.join "")
-            , JsonD.succeed ""
-            ])
-
-
-partText =
-    JsonD.map2
-        (\ty txt ->
-            if ty == "output_text" then
-                txt
-
-            else
-                "")
-        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
-        (JsonD.oneOf [ JsonD.field "text" JsonD.string, JsonD.succeed "" ])
-
-
-usageDecoder =
-    JsonD.map3
-        (\i o t -> { promptTokens = i, completionTokens = o, totalTokens = t })
-        (JsonD.oneOf [ JsonD.field "input_tokens" JsonD.int, JsonD.succeed 0 ])
-        (JsonD.oneOf [ JsonD.field "output_tokens" JsonD.int, JsonD.succeed 0 ])
-        (JsonD.oneOf [ JsonD.field "total_tokens" JsonD.int, JsonD.succeed 0 ])
