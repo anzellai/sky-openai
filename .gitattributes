@@ -1,0 +1,4 @@
+{"message":"Not Found","documentation_url":"https://docs.github.com/rest/repos/contents#get-repository-content","status":"404"}
+# GitHub Linguist has no Sky grammar yet. Sky syntax is Elm, so highlight it as Elm.
+*.sky linguist-language=Elm
+*.skyi linguist-language=Elm
