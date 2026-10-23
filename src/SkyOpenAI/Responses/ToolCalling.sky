@@ -1,0 +1,337 @@
+module SkyOpenAI.Responses.ToolCalling exposing (encodeToolRequest, decodeToolResponse)
+
+{-| Native function-calling wire protocol for the OpenAI Responses API.
+
+`SkyOpenAI.Responses` owns the public provider configuration and HTTP transport.
+This module owns the Responses-specific tool request shape, function-call response
+decoding, and opaque continuation protocol needed to submit tool outputs.
+-}
+
+import Sky.Core.Prelude exposing (..)
+import Sky.Core.Error as Error
+import Sky.Core.String as String
+import Sky.Core.List as List
+import Sky.Core.Json.Encode as JsonE
+import Sky.Core.Json.Decode as JsonD
+import SkyOpenAI.Responses.Wire exposing (messageValue, outputText, responseUsageDecoder)
+import Std.Ai.Provider as Provider
+
+type alias CallBatch =
+    { calls : List Provider.ToolCall
+    , following : List Provider.Turn
+    }
+
+type alias ContinuationContext =
+    { responseId : String
+    , following : List Provider.Turn
+    }
+
+type alias ResponseFunctionCall =
+    { id : String
+    , name : String
+    , arguments : String
+    }
+
+
+{-| Encode a native-tool Responses request. A continuation produced by this
+provider uses `previous_response_id` and sends only turns after the latest tool
+call; all other histories are replayed as Responses input items.
+-}
+encodeToolRequest : String -> Maybe String -> List Provider.Turn -> List Provider.ToolSpec -> String
+encodeToolRequest model reasoningEffort turns toolSpecs =
+    JsonE.encode
+        0
+        (JsonE.object (toolRequestFields model reasoningEffort turns toolSpecs))
+
+
+{-| Decode a raw OpenAI Responses API body into a `Provider.ToolResponse`.
+`function_call` items become local `ToolCall`s, each carrying this provider's
+opaque continuation for the next tool-result request.
+-}
+decodeToolResponse : String -> Result Error Provider.ToolResponse
+decodeToolResponse body =
+    JsonD.decodeString toolResponseDecoder body
+
+
+toolRequestFields : String -> Maybe String -> List Provider.Turn -> List Provider.ToolSpec -> List ( String, JsonE.Value )
+toolRequestFields model reasoningEffort turns toolSpecs =
+    let
+        continuation = continuationContext turns
+        input =
+            case continuation of
+
+                Just context ->
+                    inputValues context.following
+
+                Nothing ->
+                    inputValues turns
+        base =
+            [ ( "model", JsonE.string model )
+            , ( "input", JsonE.list identity input )
+            ]
+        withContinuation =
+            case continuation of
+
+                Just context ->
+                    base
+                        ++ [ ( "previous_response_id"
+                             , JsonE.string context.responseId
+                             )
+                           ]
+
+                Nothing ->
+                    base
+        withReasoning =
+            case reasoningEffort of
+
+                Just selectedEffort ->
+                    withContinuation
+                        ++ [ ( "reasoning"
+                             , JsonE.object
+                                   [ ( "effort", JsonE.string selectedEffort ) ]
+                             )
+                           ]
+
+                Nothing ->
+                    withContinuation
+        tools = requestToolValues toolSpecs
+    in
+        if List.isEmpty tools then
+            withReasoning
+
+        else
+            withReasoning ++ [ ( "tools", JsonE.list identity tools ) ]
+
+
+inputValues : List Provider.Turn -> List JsonE.Value
+inputValues turns =
+    List.concatMap turnInputValues turns
+
+
+turnInputValues : Provider.Turn -> List JsonE.Value
+turnInputValues turn =
+    case turn of
+
+        Provider.Say message ->
+            [ messageValue message ]
+
+        Provider.Called calls ->
+            List.map functionCallInputValue calls
+
+        Provider.Returned call output ->
+            [ functionCallOutputValue call output ]
+
+
+functionCallInputValue : Provider.ToolCall -> JsonE.Value
+functionCallInputValue call =
+    JsonE.object
+        [ ( "type", JsonE.string "function_call" )
+        , ( "call_id", JsonE.string call.id )
+        , ( "name", JsonE.string call.name )
+        , ( "arguments", JsonE.string call.arguments )
+        ]
+
+
+functionCallOutputValue : Provider.ToolCall -> String -> JsonE.Value
+functionCallOutputValue call output =
+    JsonE.object
+        [ ( "type", JsonE.string "function_call_output" )
+        , ( "call_id", JsonE.string call.id )
+        , ( "output", JsonE.string output )
+        ]
+
+
+requestToolValues : List Provider.ToolSpec -> List JsonE.Value
+requestToolValues toolSpecs =
+    List.map functionToolValue toolSpecs
+
+
+functionToolValue : Provider.ToolSpec -> JsonE.Value
+functionToolValue tool =
+    JsonE.object
+        [ ( "type", JsonE.string "function" )
+        , ( "name", JsonE.string tool.name )
+        , ( "description", JsonE.string tool.description )
+        , ( "parameters", JsonE.object [ ( "type", JsonE.string "object" ) ] )
+        , ( "strict", JsonE.bool False )
+        ]
+
+
+responsesContinuationPrefix : String
+responsesContinuationPrefix =
+    "sky-openai-responses:"
+
+
+continuationContext : List Provider.Turn -> Maybe ContinuationContext
+continuationContext turns =
+    case latestCallBatch turns of
+
+        Just batch ->
+            case commonResponseId batch.calls of
+
+                Just responseId ->
+                    Just
+                        { responseId = responseId, following = batch.following }
+
+                Nothing ->
+                    Nothing
+
+        Nothing ->
+            Nothing
+
+
+latestCallBatch : List Provider.Turn -> Maybe CallBatch
+latestCallBatch turns =
+    latestCallBatchHelp Nothing turns
+
+
+latestCallBatchHelp : Maybe CallBatch -> List Provider.Turn -> Maybe CallBatch
+latestCallBatchHelp latest turns =
+    case turns of
+
+        [] ->
+            latest
+
+        turn :: rest ->
+            case turn of
+
+                Provider.Called calls ->
+                    latestCallBatchHelp
+                        (Just { calls = calls, following = [] })
+                        rest
+
+                _ ->
+                    case latest of
+
+                        Just batch ->
+                            latestCallBatchHelp
+                                (Just
+                                    { batch
+                                        | following =
+                                            batch.following ++ [ turn ]
+                                    })
+                                rest
+
+                        Nothing ->
+                            latestCallBatchHelp Nothing rest
+
+
+commonResponseId : List Provider.ToolCall -> Maybe String
+commonResponseId calls =
+    case calls of
+
+        [] ->
+            Nothing
+
+        call :: rest ->
+            case responseIdForCall call of
+
+                Just responseId ->
+                    if allCallsUseResponse responseId rest then
+                        Just responseId
+
+                    else
+                        Nothing
+
+                Nothing ->
+                    Nothing
+
+
+allCallsUseResponse : String -> List Provider.ToolCall -> Bool
+allCallsUseResponse responseId calls =
+    case calls of
+
+        [] ->
+            True
+
+        call :: rest ->
+            case responseIdForCall call of
+
+                Just callResponseId ->
+                    callResponseId == responseId
+                        && allCallsUseResponse responseId rest
+
+                Nothing ->
+                    False
+
+
+responseIdForCall : Provider.ToolCall -> Maybe String
+responseIdForCall call =
+    case call.continuation of
+
+        Just continuation ->
+            if String.startsWith responsesContinuationPrefix continuation then
+                let
+                    responseId =
+                        String.dropLeft
+                            (String.length responsesContinuationPrefix)
+                            continuation
+                in
+                    if String.isEmpty responseId then
+                        Nothing
+
+                    else
+                        Just responseId
+
+            else
+                Nothing
+
+        Nothing ->
+            Nothing
+
+
+toolResponseDecoder =
+    JsonD.map4
+        (\responseId content calls usage ->
+            { content = content
+            , toolCalls = List.map (toolCallWithContinuation responseId) calls
+            , usage = usage
+            })
+        responseIdDecoder
+        outputText
+        functionCalls
+        responseUsageDecoder
+
+
+responseIdDecoder =
+    JsonD.oneOf [ JsonD.field "id" JsonD.string, JsonD.succeed "" ]
+
+
+functionCalls =
+    JsonD.oneOf
+        [ JsonD.field "output" (JsonD.list functionCallItem)
+              |> JsonD.map (List.filterMap (\item -> item))
+        , JsonD.succeed []
+        ]
+
+
+functionCallItem =
+    JsonD.map4
+        (\itemType callId name arguments ->
+            if itemType == "function_call" then
+                Just { id = callId, name = name, arguments = arguments }
+
+            else
+                Nothing)
+        (JsonD.oneOf [ JsonD.field "type" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "call_id" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "name" JsonD.string, JsonD.succeed "" ])
+        (JsonD.oneOf [ JsonD.field "arguments" JsonD.string, JsonD.succeed "" ])
+
+
+toolCallWithContinuation : String -> ResponseFunctionCall -> Provider.ToolCall
+toolCallWithContinuation responseId call =
+    { id = call.id
+    , name = call.name
+    , arguments = call.arguments
+    , continuation = continuationForResponse responseId
+    }
+
+
+continuationForResponse : String -> Maybe String
+continuationForResponse responseId =
+    if String.isEmpty responseId then
+        Nothing
+
+    else
+        Just (responsesContinuationPrefix ++ responseId)

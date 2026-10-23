@@ -5,6 +5,7 @@ Responses API body into a `Provider.ChatResponse` and encode request payloads.
 No network.
 -}
 
+import Sky.Core.Json.Decode as JsonD
 import Sky.Core.Prelude exposing (..)
 import Sky.Core.Result exposing (Result(..))
 import Sky.Test as Test exposing (Test)
@@ -20,6 +21,29 @@ sampleBody =
 toolCallBody : String
 toolCallBody =
     "{\"id\":\"resp_tool_1\",\"output\":[{\"type\":\"reasoning\",\"summary\":[]},{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_weather\",\"name\":\"weather\",\"arguments\":\"{\\\"city\\\":\\\"Berlin\\\"}\",\"status\":\"completed\"}],\"usage\":{\"input_tokens\":12,\"output_tokens\":3,\"total_tokens\":15}}"
+
+
+mixedOutputBody : String
+mixedOutputBody =
+    """
+    {
+      "id": "resp_mixed",
+      "output": [
+        {"type": "message", "role": "assistant", "content": [
+          {"type": "output_text", "text": "Hello ", "annotations": []},
+          {"type": "refusal", "refusal": "Ignored refusal."},
+          {"type": "output_text", "text": "there", "annotations": []}
+        ]},
+        {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+        {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Ignored reasoning."}]},
+        {"type": "message", "role": "assistant", "content": [
+          {"type": "output_text", "text": "! ", "annotations": []},
+          {"type": "output_text", "text": "Goodbye.", "annotations": []}
+        ]}
+      ],
+      "usage": {"input_tokens": 21, "output_tokens": 8, "total_tokens": 29}
+    }
+    """
 
 
 toolOptions : Responses.RequestOptions
@@ -48,6 +72,28 @@ foreignToolCall =
     , arguments = "{\"city\":\"Berlin\"}"
     , continuation = Just "other-provider:response_1"
     }
+
+
+forecastToolCall : Provider.ToolCall
+forecastToolCall =
+    { id = "call_forecast"
+    , name = "forecast"
+    , arguments = "{}"
+    , continuation = Just "sky-openai-responses:resp_tool_1"
+    }
+
+
+expectJson : String -> String -> Test.TestResult
+expectJson expected actual =
+    case JsonD.decodeString JsonD.value expected of
+
+        Ok expectedValue ->
+            Test.equal
+                (Ok expectedValue)
+                (JsonD.decodeString JsonD.value actual)
+
+        Err _ ->
+            Test.fail "invalid expected JSON"
 
 
 tests : List Test
@@ -176,5 +222,244 @@ tests =
                             , Provider.Returned foreignToolCall "18 C"
                             ]
                             [ weatherTool ]))
+          , Test.test
+                "latest response wins and only subsequent turns remain in order"
+                (\_ ->
+                    let
+                        latestCall =
+                            { responsesToolCall
+                                | id = "call_latest"
+                                , continuation =
+                                    Just "sky-openai-responses:resp_latest"
+                            }
+                    in
+                        expectJson
+                            """
+                            {
+                              "model": "gpt-5.6-luna",
+                              "previous_response_id": "resp_latest",
+                              "input": [
+                                {"type": "function_call_output", "call_id": "call_latest", "output": "20 C"},
+                                {"role": "user", "content": "Thanks."}
+                              ]
+                            }
+                            """
+                            (Responses.encodeToolRequest
+                                "gpt-5.6-luna"
+                                toolOptions
+                                [ Provider.Say
+                                      (Provider.user "Weather in Berlin?")
+                                , Provider.Called [ responsesToolCall ]
+                                , Provider.Returned responsesToolCall "18 C"
+                                , Provider.Say (Provider.user "Check again.")
+                                , Provider.Called [ latestCall ]
+                                , Provider.Returned latestCall "20 C"
+                                , Provider.Say (Provider.user "Thanks.")
+                                ]
+                                []))
+          , Test.test
+                "continues multiple calls sharing one response ID"
+                (\_ ->
+                    expectJson
+                        """
+                        {
+                          "model": "gpt-5.6-luna",
+                          "previous_response_id": "resp_tool_1",
+                          "input": [
+                            {"type": "function_call_output", "call_id": "call_forecast", "output": "Sunny tomorrow"},
+                            {"type": "function_call_output", "call_id": "call_weather", "output": "18 C"},
+                            {"role": "user", "content": "Thanks."}
+                          ]
+                        }
+                        """
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say
+                                  (Provider.user "Weather and forecast?")
+                            , Provider.Called
+                                  [ responsesToolCall, forecastToolCall ]
+                            , Provider.Returned
+                                  forecastToolCall
+                                  "Sunny tomorrow"
+                            , Provider.Returned responsesToolCall "18 C"
+                            , Provider.Say (Provider.user "Thanks.")
+                            ]
+                            []))
+          , Test.test
+                "replays calls with mixed response IDs"
+                (\_ ->
+                    let
+                        otherResponseCall =
+                            { forecastToolCall
+                                | continuation =
+                                    Just "sky-openai-responses:resp_tool_2"
+                            }
+                    in
+                        expectJson
+                            """
+                            {
+                              "model": "gpt-5.6-luna",
+                              "input": [
+                                {"role": "user", "content": "Weather and forecast?"},
+                                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{\"city\":\"Berlin\"}"},
+                                {"type": "function_call", "call_id": "call_forecast", "name": "forecast", "arguments": "{}"},
+                                {"type": "function_call_output", "call_id": "call_weather", "output": "18 C"},
+                                {"type": "function_call_output", "call_id": "call_forecast", "output": "Sunny tomorrow"}
+                              ]
+                            }
+                            """
+                            (Responses.encodeToolRequest
+                                "gpt-5.6-luna"
+                                toolOptions
+                                [ Provider.Say
+                                      (Provider.user "Weather and forecast?")
+                                , Provider.Called
+                                      [ responsesToolCall, otherResponseCall ]
+                                , Provider.Returned responsesToolCall "18 C"
+                                , Provider.Returned
+                                      otherResponseCall
+                                      "Sunny tomorrow"
+                                ]
+                                []))
+          , Test.suite
+                "invalid latest batch never reuses an older response"
+                (List.map
+                    (\( label, continuation ) ->
+                        Test.test
+                            ("replays when the second continuation is " ++ label)
+                            (\_ ->
+                                let
+                                    latestCall =
+                                        { responsesToolCall
+                                            | id = "call_latest"
+                                            , continuation =
+                                                Just
+                                                    "sky-openai-responses:resp_latest"
+                                        }
+                                    invalidCall =
+                                        { forecastToolCall
+                                            | continuation = continuation
+                                        }
+                                in
+                                    expectJson
+                                        """
+                                        {
+                                          "model": "gpt-5.6-luna",
+                                          "input": [
+                                            {"role": "user", "content": "Weather in Berlin?"},
+                                            {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{\"city\":\"Berlin\"}"},
+                                            {"type": "function_call_output", "call_id": "call_weather", "output": "18 C"},
+                                            {"role": "user", "content": "Check again with a forecast."},
+                                            {"type": "function_call", "call_id": "call_latest", "name": "weather", "arguments": "{\"city\":\"Berlin\"}"},
+                                            {"type": "function_call", "call_id": "call_forecast", "name": "forecast", "arguments": "{}"},
+                                            {"type": "function_call_output", "call_id": "call_latest", "output": "20 C"},
+                                            {"type": "function_call_output", "call_id": "call_forecast", "output": "Sunny tomorrow"},
+                                            {"role": "user", "content": "Thanks."}
+                                          ]
+                                        }
+                                        """
+                                        (Responses.encodeToolRequest
+                                            "gpt-5.6-luna"
+                                            toolOptions
+                                            [ Provider.Say
+                                                  (Provider.user
+                                                      "Weather in Berlin?")
+                                            , Provider.Called
+                                                  [ responsesToolCall ]
+                                            , Provider.Returned
+                                                  responsesToolCall
+                                                  "18 C"
+                                            , Provider.Say
+                                                  (Provider.user
+                                                      "Check again with a forecast.")
+                                            , Provider.Called
+                                                  [ latestCall, invalidCall ]
+                                            , Provider.Returned
+                                                  latestCall
+                                                  "20 C"
+                                            , Provider.Returned
+                                                  invalidCall
+                                                  "Sunny tomorrow"
+                                            , Provider.Say
+                                                  (Provider.user "Thanks.")
+                                            ]
+                                            [])))
+                    [ ( "missing", Nothing )
+                    , ( "empty", Just "" )
+                    , ( "an empty Responses ID", Just "sky-openai-responses:" )
+                    , ( "foreign", Just "other-provider:response_1" )
+                    ])
+          , Test.test
+                "replays after an empty latest Called batch"
+                (\_ ->
+                    expectJson
+                        """
+                        {
+                          "model": "gpt-5.6-luna",
+                          "input": [
+                            {"role": "user", "content": "Weather in Berlin?"},
+                            {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{\"city\":\"Berlin\"}"},
+                            {"type": "function_call_output", "call_id": "call_weather", "output": "18 C"},
+                            {"role": "user", "content": "Thanks."}
+                          ]
+                        }
+                        """
+                        (Responses.encodeToolRequest
+                            "gpt-5.6-luna"
+                            toolOptions
+                            [ Provider.Say (Provider.user "Weather in Berlin?")
+                            , Provider.Called [ responsesToolCall ]
+                            , Provider.Returned responsesToolCall "18 C"
+                            , Provider.Called []
+                            , Provider.Say (Provider.user "Thanks.")
+                            ]
+                            []))
+          , Test.test
+                "decodes sample text and usage without tool calls"
+                (\_ ->
+                    Test.equal
+                        (Ok
+                            { content = "Hello there"
+                            , toolCalls = []
+                            , usage =
+                                { promptTokens = 12
+                                , completionTokens = 3
+                                , totalTokens = 15
+                                }
+                            })
+                        (Responses.decodeToolResponse sampleBody))
+          , Test.test
+                "both decoders preserve mixed output text order and usage"
+                (\_ ->
+                    Test.equal
+                        ( Ok
+                              { content = "Hello there! Goodbye."
+                              , usage =
+                                  { promptTokens = 21
+                                  , completionTokens = 8
+                                  , totalTokens = 29
+                                  }
+                              }
+                        , Ok
+                              { content = "Hello there! Goodbye."
+                              , toolCalls =
+                                  [ { id = "call_weather"
+                                    , name = "weather"
+                                    , arguments = "{}"
+                                    , continuation =
+                                        Just "sky-openai-responses:resp_mixed"
+                                    }
+                                  ]
+                              , usage =
+                                  { promptTokens = 21
+                                  , completionTokens = 8
+                                  , totalTokens = 29
+                                  }
+                              }
+                        )
+                        ( Responses.decodeResponse mixedOutputBody
+                        , Responses.decodeToolResponse mixedOutputBody
+                        ))
           ]
     ]

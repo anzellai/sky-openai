@@ -122,10 +122,26 @@ Agent.oneShot db (Responses.provider key "gpt-4o-mini")
 ## Test
 
 ```bash
+sky verify
+```
+
+Requires Python 3.9+ (standard library only) for the HTTP suite. `sky verify`
+discovers all suites; each HTTP test starts a request-validating fixture on an
+ephemeral loopback port and closes it after the request. No external API,
+credentials, or Python packages are needed; outbound proxies point at the fixture
+to block accidental external requests.
+
+Coverage includes multi-round tool continuations and replay fallbacks, shared
+decoder behavior, and both provider HTTP paths (request method, endpoint, bearer
+header, JSON payload, success, HTTP errors, decode errors, and transport failures).
+
+To run only the pure encoder/decoder tests, without the HTTP fixture:
+
+```bash
 sky test tests/ResponsesTest.sky
 ```
 
-The tests encode and decode Responses bodies offline. No network, no key.
+The HTTP suite also runs directly with `sky test tests/ResponsesHttpTest.sky`.
 
 ## Licence
 
